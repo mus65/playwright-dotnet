@@ -24,8 +24,7 @@
 
 using Microsoft.Playwright;
 
-using var playwright = await Playwright.CreateAsync();
-await using var browser = await playwright.Chromium.LaunchAsync();
+await using var browser = await Playwright.ConnectAsync("ws://localhost:3000/", "chromium");
 var page = await browser.NewPageAsync();
 await page.GotoAsync("https://playwright.dev/dotnet");
 await page.ScreenshotAsync(new PageScreenshotOptions { Path = "screenshot.png" });

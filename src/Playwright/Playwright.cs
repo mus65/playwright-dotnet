@@ -23,8 +23,12 @@
  */
 using System;
 using System.Diagnostics.CodeAnalysis;
+using System.Net.WebSockets;
+using System.Reflection;
 using System.Text.Json;
+using System.Threading;
 using System.Threading.Tasks;
+using Microsoft.Playwright.Core;
 using Microsoft.Playwright.Helpers;
 using Microsoft.Playwright.Transport;
 
@@ -61,5 +65,96 @@ public static class Playwright
         };
         connection.Close += (_, reason) => transport.Close(reason);
         return await connection.InitializePlaywrightAsync().ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Connects to a browser on a remote Playwright instance.
+    /// In contrast to <see cref="Core.BrowserType.ConnectAsync"/>, this doesn't require a node process and uses a managed WebSocket implementation instead.
+    /// </summary>
+    /// <param name="wsEndpoint">The WebSocket endpoint to connect to.</param>
+    /// <param name="browserName">The name of the browser.</param>
+    /// <param name="options">Optional connection options.</param>
+    /// <param name="cancellationToken">Cancellation token.</param>
+    /// <returns>The browser.</returns>
+    public static async Task<IBrowser> ConnectAsync(string wsEndpoint, string browserName, BrowserTypeConnectOptions? options = null, CancellationToken cancellationToken = default)
+    {
+        ClientWebSocket webSocket = new();
+        webSocket.Options.SetRequestHeader("x-playwright-browser", browserName);
+
+        // Needed for server-side version compatibility check. The server will return HTTP 428 on mismatch.
+        Version playwrightVersion = Assembly.GetExecutingAssembly().GetName().Version;
+        webSocket.Options.SetRequestHeader("user-agent", $"Playwright/{playwrightVersion.Major}.{playwrightVersion.Minor}.{playwrightVersion.Build}");
+
+        if (options?.Headers != null)
+        {
+            foreach (var header in options.Headers)
+            {
+                webSocket.Options.SetRequestHeader(header.Key, header.Value);
+            }
+        }
+
+        if (options != null)
+        {
+            webSocket.Options.SetRequestHeader("x-playwright-launch-options", JsonSerializer.Serialize(options, JsonExtensions.DefaultJsonSerializerOptions));
+        }
+
+        try
+        {
+            await webSocket.ConnectAsync(new Uri(wsEndpoint), cancellationToken).ConfigureAwait(false);
+        }
+        catch
+        {
+            webSocket.Dispose();
+            throw;
+        }
+
+        var transport = new WebSocketTransport(webSocket);
+
+        var connection = new Connection();
+        connection.MarkAsRemote();
+
+        transport.MessageReceived += (_, message) =>
+        {
+            Connection.TraceMessage("pw:channel:recv", message);
+            connection.Dispatch(JsonSerializer.Deserialize<PlaywrightServerMessage>(message, JsonExtensions.DefaultJsonSerializerOptions)!);
+        };
+
+        Browser? browser = null;
+
+        transport.TransportClosed += (_, reason) =>
+        {
+            // Emulate all pages, contexts and the browser closing upon disconnect.
+            if (browser?._contexts != null)
+            {
+                foreach (BrowserContext context in browser._contexts.ToArray())
+                {
+                    foreach (Page page in context._pages.ToArray())
+                    {
+                        page.OnClose();
+                    }
+                    context.OnClose();
+                }
+            }
+            browser?.DidClose();
+            connection.DoClose(reason);
+        };
+
+        connection.OnMessage = (message, keepNulls) =>
+        {
+            var rawMessage = JsonSerializer.SerializeToUtf8Bytes(message, keepNulls ? connection.DefaultJsonSerializerOptionsKeepNulls : connection.DefaultJsonSerializerOptions);
+            Connection.TraceMessage("pw:channel:send", rawMessage);
+            return transport.SendAsync(rawMessage);
+        };
+
+        connection.Close += (_, reason) => transport.Close(reason);
+
+        PlaywrightImpl playwright = await connection.InitializePlaywrightAsync().ConfigureAwait(false);
+        browser = playwright.PreLaunchedBrowser;
+
+        browser.ShouldCloseConnectionOnClose = true;
+        browser.Disconnected += (_, _) => _ = transport.DisposeAsync();
+        browser.ConnectToBrowserType((Core.BrowserType)playwright[browserName], null);
+
+        return browser;
     }
 }
